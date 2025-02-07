@@ -275,9 +275,9 @@ impl MetricsCollector {
     fn new() -> Self {
         Self {
             system: System::new(),
-            system_refresh_kind: RefreshKind::everything()
-                .with_cpu(RefreshKind::cpu(&Default::default()).unwrap())
-                .with_memory(RefreshKind::memory(&Default::default()).unwrap().with_ram()),
+            system_refresh_kind: RefreshKind::default()
+                .with_cpu(CpuRefreshKind::with_cpu_usage(Default::default()))
+                .with_memory(MemoryRefreshKind::with_ram(Default::default())),
             request_count: 0,
             request_failed_count: 0,
             request_duration: Duration::default(),
