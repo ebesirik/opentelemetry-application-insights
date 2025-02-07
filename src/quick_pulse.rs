@@ -260,8 +260,6 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
 
 struct MetricsCollector {
     system: System,
-    cpu_history: u64,
-    last_cpu_read_time: DateTime<Local>,
     system_refresh_kind: RefreshKind,
     request_count: usize,
     request_failed_count: usize,
@@ -277,11 +275,9 @@ impl MetricsCollector {
     fn new() -> Self {
         Self {
             system: System::new(),
-            cpu_history: 0,
-            last_cpu_read_time: Local::now(),
-            system_refresh_kind: RefreshKind::new()
-                .with_cpu(CpuRefreshKind::new().with_cpu_usage())
-                .with_memory(MemoryRefreshKind::new().with_ram()),
+            system_refresh_kind: RefreshKind::everything()
+                .with_cpu(RefreshKind::cpu(&Default::default()).unwrap())
+                .with_memory(RefreshKind::memory(&Default::default()).unwrap().with_ram()),
             request_count: 0,
             request_failed_count: 0,
             request_duration: Duration::default(),
@@ -345,8 +341,8 @@ impl MetricsCollector {
         for cpu in self.system.cpus() {
             cpu_usage += f64::from(cpu.cpu_usage());
         }
-        let cpu_cores = self.system.cpus().len() as f64;
-        cpu_usage /= cpu_cores;
+        // let cpu_cores = self.system.cpus().len() as f64;
+        // cpu_usage /= cpu_cores;
         // let cpu_usage: f64 = self.get_cpu_usage();
         metrics.push(QuickPulseMetric {
             name: METRIC_PROCESSOR_TIME,
@@ -355,7 +351,7 @@ impl MetricsCollector {
         });
     }
 
-    fn read_cpuacct_stat() -> u64 {
+    /*fn read_cpuacct_stat() -> u64 {
         let path = "/sys/fs/cgroup/cpuacct/cpuacct.usage";
 
         if let Ok(contents) = fs::read_to_string(path) {
@@ -387,17 +383,17 @@ impl MetricsCollector {
         // let cpu_usage = (cpu_seconds / cpu_cores as f64) * 100.0;
 
         cpu_usage
-    }
+    }*/
 
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
-        let memory_usage = fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        /*let memory_usage = fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
             .unwrap_or_else(|_| "0".to_string())
             .trim()
             .parse::<f64>()
-            .unwrap_or(0.0);
+            .unwrap_or(0.0);*/
         metrics.push(QuickPulseMetric {
             name: METRIC_COMMITTED_BYTES,
-            value: memory_usage,//self.system.used_memory() as f64,
+            value: self.system.used_memory() as f64,//memory_usage,//self.system.used_memory() as f64,
             weight: 1,
         });
     }
