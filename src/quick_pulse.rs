@@ -18,14 +18,10 @@ use opentelemetry_sdk::{
     Resource,
 };
 use opentelemetry_semantic_conventions as semcov;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
-    time::SystemTime,
-};
+use std::{fs, sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+}, time::Duration, time::SystemTime};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 const MAX_POST_WAIT_TIME: Duration = Duration::from_secs(20);
@@ -344,7 +340,7 @@ impl MetricsCollector {
         for cpu in self.system.cpus() {
             cpu_usage += f64::from(cpu.cpu_usage());
         }
-        eprintln!("cpu usage: {}", cpu_usage);
+        cpu_usage /= 100.0;
         metrics.push(QuickPulseMetric {
             name: METRIC_PROCESSOR_TIME,
             value: cpu_usage,
@@ -353,10 +349,14 @@ impl MetricsCollector {
     }
 
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
-        eprintln!("memory usage: {}", self.system.used_memory());
+        let memory_usage = fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            .unwrap_or_else(|_| "0".to_string())
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0);
         metrics.push(QuickPulseMetric {
             name: METRIC_COMMITTED_BYTES,
-            value: self.system.used_memory() as f64,
+            value: memory_usage,//self.system.used_memory() as f64,
             weight: 1,
         });
     }
