@@ -338,10 +338,10 @@ impl MetricsCollector {
 
     fn collect_cpu_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
         // &self.system.refresh_cpu_usage();
-        let mut cpu_usage = f64::from(self.system.global_cpu_usage());
-        /*for cpu in self.system.cpus() {
+        let mut cpu_usage = 0.0;//f64::from(self.system.global_cpu_usage());
+        for cpu in self.system.cpus() {
             cpu_usage += f64::from(cpu.cpu_usage());
-        }*/
+        }
         // let cpu_cores = self.system.cpus().len() as f64;
         // cpu_usage /= cpu_cores;
         // let cpu_usage: f64 = self.get_cpu_usage();
