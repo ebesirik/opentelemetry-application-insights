@@ -277,7 +277,7 @@ impl MetricsCollector {
             system: System::new(),
             system_refresh_kind: RefreshKind::default()
                 .with_cpu(CpuRefreshKind::with_cpu_usage(Default::default()))
-                .with_memory(MemoryRefreshKind::with_ram(Default::default())),
+                .with_memory(MemoryRefreshKind::everything()),
             request_count: 0,
             request_failed_count: 0,
             request_duration: Duration::default(),
@@ -337,10 +337,11 @@ impl MetricsCollector {
     }
 
     fn collect_cpu_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
-        let mut cpu_usage = 0.;
-        for cpu in self.system.cpus() {
+        // &self.system.refresh_cpu_usage();
+        let mut cpu_usage = f64::from(self.system.global_cpu_usage());
+        /*for cpu in self.system.cpus() {
             cpu_usage += f64::from(cpu.cpu_usage());
-        }
+        }*/
         // let cpu_cores = self.system.cpus().len() as f64;
         // cpu_usage /= cpu_cores;
         // let cpu_usage: f64 = self.get_cpu_usage();
@@ -391,9 +392,13 @@ impl MetricsCollector {
             .trim()
             .parse::<f64>()
             .unwrap_or(0.0);*/
+        let mut used_mem = self.system.used_memory() as f64;
+        if let Some(m) = &self.system.cgroup_limits(){
+            used_mem = (m.total_memory - m.free_memory) as f64;
+        }
         metrics.push(QuickPulseMetric {
             name: METRIC_COMMITTED_BYTES,
-            value: self.system.used_memory() as f64,//memory_usage,//self.system.used_memory() as f64,
+            value: used_mem,//memory_usage,//self.system.used_memory() as f64,
             weight: 1,
         });
     }
