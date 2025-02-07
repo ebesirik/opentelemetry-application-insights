@@ -336,16 +336,43 @@ impl MetricsCollector {
     }
 
     fn collect_cpu_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
-        let mut cpu_usage = 0.;
+        /*let mut cpu_usage = 0.;
         for cpu in self.system.cpus() {
             cpu_usage += f64::from(cpu.cpu_usage());
         }
-        cpu_usage /= 100.0;
+        cpu_usage /= 100.0;*/
+        let cpu_usage: f64 = Self::calculate_cpu_usage();
         metrics.push(QuickPulseMetric {
             name: METRIC_PROCESSOR_TIME,
             value: cpu_usage,
             weight: 1,
         });
+    }
+
+    fn calculate_cpu_usage() -> f64 {
+        let cpu_quota = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+            .unwrap_or_else(|_| "0".to_string())
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+
+        let cpu_period = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+            .unwrap_or_else(|_| "0".to_string())
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+
+        let cpu_usage = fs::read_to_string("/sys/fs/cgroup/cpu/cpuacct.usage")
+            .unwrap_or_else(|_| "0".to_string())
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+
+        if cpu_quota > 0.0 && cpu_period > 0.0 {
+            (cpu_usage / (cpu_quota * cpu_period)) * 100.0
+        } else {
+            0.0
+        }
     }
 
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
