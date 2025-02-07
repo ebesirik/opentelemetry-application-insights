@@ -356,7 +356,7 @@ impl MetricsCollector {
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
         metrics.push(QuickPulseMetric {
             name: METRIC_COMMITTED_BYTES,
-            value: (self.system.used_memory() as f64) * 1024.0,
+            value: (self.system.used_memory() as f64) / 1024.0,
             weight: 1,
         });
     }
