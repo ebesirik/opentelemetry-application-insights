@@ -260,7 +260,7 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
 
 struct MetricsCollector {
     system: System,
-    cpu_history: (u64, u64),
+    cpu_history: u64,
     last_cpu_read_time: DateTime<Local>,
     system_refresh_kind: RefreshKind,
     request_count: usize,
@@ -277,7 +277,7 @@ impl MetricsCollector {
     fn new() -> Self {
         Self {
             system: System::new(),
-            cpu_history: (0, 0),
+            cpu_history: 0,
             last_cpu_read_time: Local::now(),
             system_refresh_kind: RefreshKind::new()
                 .with_cpu(CpuRefreshKind::new().with_cpu_usage())
@@ -354,51 +354,36 @@ impl MetricsCollector {
         });
     }
 
-    fn read_cpuacct_stat() -> (u64, u64) {
-        let path = "/sys/fs/cgroup/cpuacct/cpuacct.stat";
+    fn read_cpuacct_stat() -> u64 {
+        let path = "/sys/fs/cgroup/cpuacct/cpuacct.usage";
 
         if let Ok(contents) = fs::read_to_string(path) {
-            let mut user = 0;
-            let mut system = 0;
-
-            for line in contents.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() == 2 {
-                    match parts[0] {
-                        "user" => user = parts[1].parse::<u64>().unwrap_or(0),
-                        "system" => system = parts[1].parse::<u64>().unwrap_or(0),
-                        _ => (),
-                    }
-                }
-            }
-            return (user, system);
+            return contents.trim().parse::<u64>().unwrap_or(0);
         }
-
-        (0, 0)
+        0
     }
 
     fn get_cpu_usage(&mut self) -> f64 {
-        let (user_before, system_before) = self.cpu_history;
+        let cpu_before  = self.cpu_history;
         // sleep(Duration::from_secs(1)); // Wait 1 second
-        let (user_after, system_after) = Self::read_cpuacct_stat();
+        let cpu_after  = Self::read_cpuacct_stat();
         let now = Local::now();
-        let diff = now.signed_duration_since(self.last_cpu_read_time).num_milliseconds();
-        self.cpu_history = (user_after, system_after);
+        let time_diff_ms = now.signed_duration_since(self.last_cpu_read_time).num_milliseconds();
+        self.cpu_history = cpu_before;
         self.last_cpu_read_time = now;
+        let time_seconds = time_diff_ms as f64 / 1000.0;
 
-        let user_diff = user_after.saturating_sub(user_before);
-        let system_diff = system_after.saturating_sub(system_before);
-
-        let total_diff = user_diff + system_diff;
+        let cpu_diff = cpu_after.saturating_sub(cpu_before);
 
         // Convert jiffies to seconds (assuming 100 jiffies per second)
-        let cpu_seconds = total_diff as f64 / ((diff * 10) as f64);
+        let cpu_seconds = cpu_diff as f64 / 1_000_000_000.0;
+        let cpu_cores = self.system.cpus().len() as f64;
+        let cpu_usage = (cpu_seconds / time_seconds) * (100.0 / cpu_cores);
 
         // Get the number of CPU cores
-        let cpu_cores = self.system.cpus().len();
 
         // Calculate CPU usage percentage
-        let cpu_usage = (cpu_seconds / cpu_cores as f64) * 100.0;
+        // let cpu_usage = (cpu_seconds / cpu_cores as f64) * 100.0;
 
         cpu_usage
     }
