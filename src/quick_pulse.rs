@@ -341,11 +341,10 @@ impl MetricsCollector {
 
     fn collect_cpu_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
         let mut cpu_usage = 0.;
-        let cpu_count = self.system.cpus().len() as f64;
         for cpu in self.system.cpus() {
             cpu_usage += f64::from(cpu.cpu_usage());
         }
-        cpu_usage /= cpu_count;
+        eprintln!("cpu usage: {}", cpu_usage);
         metrics.push(QuickPulseMetric {
             name: METRIC_PROCESSOR_TIME,
             value: cpu_usage,
@@ -354,9 +353,10 @@ impl MetricsCollector {
     }
 
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
+        eprintln!("memory usage: {}", self.system.used_memory());
         metrics.push(QuickPulseMetric {
             name: METRIC_COMMITTED_BYTES,
-            value: (self.system.used_memory() as f64) / 1024.0,
+            value: self.system.used_memory() as f64,
             weight: 1,
         });
     }
