@@ -22,6 +22,7 @@ use std::{fs, sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 }, time::Duration, time::SystemTime};
+use chrono::{DateTime, Local};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 const MAX_POST_WAIT_TIME: Duration = Duration::from_secs(20);
@@ -259,6 +260,8 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
 
 struct MetricsCollector {
     system: System,
+    cpu_history: (u64, u64),
+    last_cpu_read_time: DateTime<Local>,
     system_refresh_kind: RefreshKind,
     request_count: usize,
     request_failed_count: usize,
@@ -274,6 +277,8 @@ impl MetricsCollector {
     fn new() -> Self {
         Self {
             system: System::new(),
+            cpu_history: (0, 0),
+            last_cpu_read_time: Local::now(),
             system_refresh_kind: RefreshKind::new()
                 .with_cpu(CpuRefreshKind::new().with_cpu_usage())
                 .with_memory(MemoryRefreshKind::new().with_ram()),
@@ -341,7 +346,7 @@ impl MetricsCollector {
             cpu_usage += f64::from(cpu.cpu_usage());
         }
         cpu_usage /= 100.0;*/
-        let cpu_usage: f64 = Self::calculate_cpu_usage();
+        let cpu_usage: f64 = self.get_cpu_usage();
         metrics.push(QuickPulseMetric {
             name: METRIC_PROCESSOR_TIME,
             value: cpu_usage,
@@ -349,30 +354,53 @@ impl MetricsCollector {
         });
     }
 
-    fn calculate_cpu_usage() -> f64 {
-        let cpu_quota = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-            .unwrap_or_else(|_| "0".to_string())
-            .trim()
-            .parse::<f64>()
-            .unwrap_or(0.0);
+    fn read_cpuacct_stat() -> (u64, u64) {
+        let path = "/sys/fs/cgroup/cpuacct/cpuacct.stat";
 
-        let cpu_period = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-            .unwrap_or_else(|_| "0".to_string())
-            .trim()
-            .parse::<f64>()
-            .unwrap_or(0.0);
+        if let Ok(contents) = fs::read_to_string(path) {
+            let mut user = 0;
+            let mut system = 0;
 
-        let cpu_usage = fs::read_to_string("/sys/fs/cgroup/cpu/cpuacct.usage")
-            .unwrap_or_else(|_| "0".to_string())
-            .trim()
-            .parse::<f64>()
-            .unwrap_or(0.0);
-
-        if cpu_quota > 0.0 && cpu_period > 0.0 {
-            (cpu_usage / (cpu_quota * cpu_period)) * 100.0
-        } else {
-            0.0
+            for line in contents.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() == 2 {
+                    match parts[0] {
+                        "user" => user = parts[1].parse::<u64>().unwrap_or(0),
+                        "system" => system = parts[1].parse::<u64>().unwrap_or(0),
+                        _ => (),
+                    }
+                }
+            }
+            return (user, system);
         }
+
+        (0, 0)
+    }
+
+    fn get_cpu_usage(&mut self) -> f64 {
+        let (user_before, system_before) = self.cpu_history;
+        // sleep(Duration::from_secs(1)); // Wait 1 second
+        let (user_after, system_after) = Self::read_cpuacct_stat();
+        let now = Local::now();
+        let diff = now.signed_duration_since(self.last_cpu_read_time).num_milliseconds();
+        self.cpu_history = (user_after, system_after);
+        self.last_cpu_read_time = now;
+
+        let user_diff = user_after.saturating_sub(user_before);
+        let system_diff = system_after.saturating_sub(system_before);
+
+        let total_diff = user_diff + system_diff;
+
+        // Convert jiffies to seconds (assuming 100 jiffies per second)
+        let cpu_seconds = total_diff as f64 / ((diff * 10) as f64);
+
+        // Get the number of CPU cores
+        let cpu_cores = self.system.cpus().len();
+
+        // Calculate CPU usage percentage
+        let cpu_usage = (cpu_seconds / cpu_cores as f64) * 100.0;
+
+        cpu_usage
     }
 
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
