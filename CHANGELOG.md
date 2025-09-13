@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.43.0] - 2025-09-01
+
+- In live metrics, report CPU and memory usage of the current process rather than the system. This is more useful, especially when more than one application is running on the system. This also follows what the .NET SDK does. Thanks, [rafamerlin@](https://github.com/rafamerlin).
+
+## [0.42.0] - 2025-08-09
+
+- Add retries. No configuration necessary (or available). opentelemetry-application-insights will now retry uploads, hopefully resulting in fewer telemetry getting lost. Thanks, [alexbrt@](https://github.com/alexbrt).
+- Upgrade `sysinfo` to `v0.36`.
+
+## [0.41.0] - 2025-05-25
+
+- Upgrade `opentelemetry` dependencies to `v0.30`.
+
+## [0.40.0] - 2025-03-22
+
+- Upgrade `opentelemetry` dependencies to `v0.29`.
+
+- **Breaking**: Remove pipeline API. This requires some consumer changes:
+
+  In short:
+
+  - Create exporter using `opentelemetry_application_insights::Exporter::new_from_connection_string`.
+  - Configure Application Insights specifics using `.with_` functions on the exporter.
+  - Create and configure trace, metrics, and logs providers using `opentelemetry_sdk::trace::SdkTracerProvider`, `opentelemetry_sdk::metrics::SdkMeterProvider`, and `opentelemetry_sdk::logs::SdkLoggerProvider`.
+
+  In detail, here are replacements for functions on the removed pipeline API:
+
+  - `new_pipeline_from_env` --> `Exporter::new_from_env`
+  - `new_pipeline_from_connection_string` --> `Exporter::new_from_connection_string`
+  - `pipeline_builder.with_sample_rate` --> `exporter.with_sample_rate`
+  - `pipeline_builder.with_resource_attributes_in_events_and_logs` --> `exporter.with_resource_attributes_in_events_and_logs`
+  - `pipeline_builder.with_trace_config` --> individual functions on [`TracerProviderBuilder`](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/trace/struct.TracerProviderBuilder.html)
+  - `pipeline_builder.with_service_name` --> create resource using [`Resource::builder()`](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/struct.Resource.html#method.builder)[`.with_service_name(...)`](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/resource/struct.ResourceBuilder.html#method.with_service_name)[`.build()`](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/resource/struct.ResourceBuilder.html#method.build) and apply using [`.with_resource(...)`](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/trace/struct.TracerProviderBuilder.html#method.with_resource).
+  - `pipeline_builder.with_live_metrics` --> create span processor using `opentelemetry_application_insights::LiveMetricsSpanProcessor::new(exporter, runtime)` and apply using [`.with_span_processor(...)`](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/trace/struct.TracerProviderBuilder.html#method.with_span_processor). The live metrics span processor requires an async runtime and an async client. Therefore you probably also want to use an [async span processor for general trace collection](https://docs.rs/opentelemetry_sdk/0.29.0/opentelemetry_sdk/trace/span_processor_with_async_runtime/struct.BatchSpanProcessor.html).
+
+- **Breaking**: The **trace** feature no longer enables the **opentelemetry_sdk/experimental_trace_batch_span_processor_with_async_runtime** feature.
+
+## [0.39.0] - 2025-02-23
+
+- Add option `.with_resource_attributes_in_events_and_logs(true)`. When enabled, resource attributes are included in events and logs, i.e. Trace, Exception and Event telemetry.
+
+## [0.38.0] - 2025-02-22
+
+- Upgrade `opentelemetry` dependencies to `v0.28`.
+
+  - The `trace` feature turns on `opentelemetry_sdk/experimental_trace_batch_span_processor_with_async_runtime` in this release to avoid breaking API changes and to make this release simpler for me. In the future I hope to align the API with other crates like `opentelemetry-otlp`, which means removing the pipeline API. Examples have already been updated to the new API.
+
+  - If you're using `logs` or `metrics` make sure you use matching combinations of sync/async HTTP clients and runtimes. E.g.:
+
+    - Use `reqwest::blocking::Client` with `.with_batch_exporter(exporter)`. If you're already in an async context, you might need to create the client using `std::thread::spawn(reqwest::blocking::Client::new).join().unwrap()`.
+    - Use `reqwest::Client` with `.with_log_processor(opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor::builder(exporter, opentelemetry_sdk::runtime::Tokio).build())`.
+
+  - The `db.system` attribute has been deprecated. You can use `db.system.name` going forward, although the deprecated attribute continues to work.
+
 ## [0.37.0] - 2024-11-12
 
 - Upgrade `opentelemetry` dependencies to `v0.27`.
@@ -284,7 +338,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - First release.
 
-[unreleased]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.37.0...HEAD
+[unreleased]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.43.0...HEAD
+[0.43.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.42.0...0.43.0
+[0.42.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.41.0...0.42.0
+[0.41.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.40.0...0.41.0
+[0.40.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.39.0...0.40.0
+[0.39.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.38.0...0.39.0
+[0.38.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.37.0...0.38.0
 [0.37.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.36.0...0.37.0
 [0.36.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.35.0...0.36.0
 [0.35.0]: https://github.com/frigus02/opentelemetry-application-insights/compare/0.34.0...0.35.0

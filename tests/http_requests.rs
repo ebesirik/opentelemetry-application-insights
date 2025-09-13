@@ -17,12 +17,12 @@ use opentelemetry::{
     },
     Context, KeyValue,
 };
-use opentelemetry_application_insights::{attrs as ai, new_pipeline_from_connection_string};
-use opentelemetry_sdk::Resource;
+use opentelemetry_application_insights::{attrs as ai, Exporter};
+use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider, Resource};
 use opentelemetry_semantic_conventions as semcov;
 use recording_client::record;
 use std::{collections::HashMap, time::Duration};
-use tick::{AsyncStdTick, NoTick, TokioTick};
+use tick::{NoTick, TokioTick};
 
 // Fake instrumentation key (this is a random uuid)
 const CONNECTION_STRING: &str = "InstrumentationKey=0fdcec70-0ce5-4085-89d9-9ae8ead9af66";
@@ -30,31 +30,35 @@ const CONNECTION_STRING: &str = "InstrumentationKey=0fdcec70-0ce5-4085-89d9-9ae8
 #[test]
 fn traces() {
     let requests = record(NoTick, |client| {
-        // Fake instrumentation key (this is a random uuid)
-        let client_provider = new_pipeline_from_connection_string(CONNECTION_STRING)
-            .expect("connection string is valid")
-            .with_client(client.clone())
-            .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
-                Resource::new(vec![
-                    KeyValue::new(semcov::resource::SERVICE_NAMESPACE, "test"),
-                    KeyValue::new(semcov::resource::SERVICE_NAME, "client"),
-                    KeyValue::new(semcov::resource::DEVICE_ID, "123"),
-                    KeyValue::new(semcov::resource::DEVICE_MODEL_NAME, "device"),
-                ]),
-            ))
-            .build_simple();
+        let exporter = Exporter::new_from_connection_string(CONNECTION_STRING, client)
+            .expect("connection string is valid");
+
+        let client_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .with_resource(
+                Resource::builder_empty()
+                    .with_attributes(vec![
+                        KeyValue::new(semcov::resource::SERVICE_NAMESPACE, "test"),
+                        KeyValue::new(semcov::resource::SERVICE_NAME, "client"),
+                        KeyValue::new(semcov::resource::DEVICE_ID, "123"),
+                        KeyValue::new(semcov::resource::DEVICE_MODEL_NAME, "device"),
+                    ])
+                    .build(),
+            )
+            .build();
         let client_tracer = client_provider.tracer("test");
 
-        let server_provider = new_pipeline_from_connection_string(CONNECTION_STRING)
-            .expect("connection string is valid")
-            .with_client(client)
-            .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
-                Resource::new(vec![
-                    KeyValue::new(semcov::resource::SERVICE_NAMESPACE, "test"),
-                    KeyValue::new(semcov::resource::SERVICE_NAME, "server"),
-                ]),
-            ))
-            .build_simple();
+        let server_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .with_resource(
+                Resource::builder_empty()
+                    .with_attributes(vec![
+                        KeyValue::new(semcov::resource::SERVICE_NAMESPACE, "test"),
+                        KeyValue::new(semcov::resource::SERVICE_NAME, "server"),
+                    ])
+                    .build(),
+            )
+            .build();
         let server_tracer = server_provider.tracer("test");
 
         // An HTTP client make a request
@@ -135,63 +139,83 @@ fn traces() {
             // other way around.
             std::thread::sleep(Duration::from_secs(1));
         }
+
+        client_provider.shutdown().unwrap();
+        server_provider.shutdown().unwrap();
     });
     let traces = requests_to_string(requests);
     insta::assert_snapshot!(traces);
 }
 
-#[async_std::test]
-async fn traces_batch_async_std() {
-    let requests = record(AsyncStdTick, |client| {
-        let tracer_provider = new_pipeline_from_connection_string(CONNECTION_STRING)
-            .expect("connection string is valid")
-            .with_client(client)
-            .build_batch(opentelemetry_sdk::runtime::AsyncStd);
-        let tracer = tracer_provider.tracer("test");
-
-        tracer.in_span("async-std", |_cx| {});
-    });
-    let traces_batch_async_std = requests_to_string(requests);
-    insta::assert_snapshot!(traces_batch_async_std);
-}
-
 #[tokio::test]
 async fn traces_batch_tokio() {
     let requests = record(TokioTick, |client| {
-        let tracer_provider = new_pipeline_from_connection_string(CONNECTION_STRING)
-            .expect("connection string is valid")
-            .with_client(client)
-            .build_batch(opentelemetry_sdk::runtime::TokioCurrentThread);
+        let exporter = Exporter::new_from_connection_string(CONNECTION_STRING, client)
+            .expect("connection string is valid");
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_span_processor(opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(exporter, opentelemetry_sdk::runtime::TokioCurrentThread).build())
+            .build();
         let tracer = tracer_provider.tracer("test");
 
         tracer.in_span("tokio", |_cx| {});
+
+        tracer_provider.shutdown().unwrap();
     });
     let traces_batch_tokio = requests_to_string(requests);
     insta::assert_snapshot!(traces_batch_tokio);
 }
 
-#[tokio::test]
-async fn logs() {
-    let requests = record(TokioTick, |client| {
-        // Setup tracing
-        let tracer_provider = new_pipeline_from_connection_string(CONNECTION_STRING)
+#[test]
+fn traces_with_resource_attributes_in_events_and_logs() {
+    let requests = record(NoTick, |client| {
+        let exporter = Exporter::new_from_connection_string(CONNECTION_STRING, client)
             .expect("connection string is valid")
-            .with_client(client.clone())
-            .build_batch(opentelemetry_sdk::runtime::TokioCurrentThread);
+            .with_resource_attributes_in_events_and_logs(true);
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .with_resource(
+                Resource::builder_empty()
+                    .with_attribute(KeyValue::new("attr", "value"))
+                    .build(),
+            )
+            .build();
+        let tracer = tracer_provider.tracer("test");
+
+        tracer.in_span("resource attributes in events", |_cx| {
+            get_active_span(|span| {
+                span.add_event("An event!", vec![]);
+            });
+        });
+
+        tracer_provider.shutdown().unwrap();
+    });
+    let traces_with_resource_attributes_in_events_and_logs = requests_to_string(requests);
+    insta::assert_snapshot!(traces_with_resource_attributes_in_events_and_logs);
+}
+
+#[test]
+fn logs() {
+    let requests = record(NoTick, |client| {
+        let exporter = Exporter::new_from_connection_string(CONNECTION_STRING, client)
+            .expect("connection string is valid");
+
+        // Setup tracing
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
         let tracer = tracer_provider.tracer("test");
 
         // Setup logging
-        let exporter = opentelemetry_application_insights::Exporter::new_from_connection_string(
-            CONNECTION_STRING,
-            client,
-        )
-        .expect("connection string is valid");
-        let logger_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::TokioCurrentThread)
-            .with_resource(Resource::new(vec![
-                KeyValue::new(semcov::resource::SERVICE_NAMESPACE, "test"),
-                KeyValue::new(semcov::resource::SERVICE_NAME, "client"),
-            ]))
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                Resource::builder_empty()
+                    .with_attributes(vec![
+                        KeyValue::new(semcov::resource::SERVICE_NAMESPACE, "test"),
+                        KeyValue::new(semcov::resource::SERVICE_NAME, "client"),
+                    ])
+                    .build(),
+            )
             .build();
 
         let otel_log_appender =
@@ -220,20 +244,50 @@ async fn logs() {
         });
 
         logger_provider.shutdown().unwrap();
+        tracer_provider.shutdown().unwrap();
     });
     let logs = requests_to_string(requests);
     insta::assert_snapshot!(logs);
 }
 
+#[test]
+fn logs_with_resource_attributes_in_events_and_logs() {
+    let requests = record(NoTick, |client| {
+        let exporter = Exporter::new_from_connection_string(CONNECTION_STRING, client)
+            .expect("connection string is valid")
+            .with_resource_attributes_in_events_and_logs(true);
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                Resource::builder_empty()
+                    .with_attribute(KeyValue::new("attr", "value"))
+                    .build(),
+            )
+            .build();
+
+        let logger = logger_provider.logger("test");
+        let mut record = logger.create_log_record();
+        record.set_body("message".into());
+        logger.emit(record);
+
+        logger_provider.shutdown().unwrap();
+    });
+    let logs_with_resource_attributes_in_events_and_logs = requests_to_string(requests);
+    insta::assert_snapshot!(logs_with_resource_attributes_in_events_and_logs);
+}
+
 #[tokio::test]
 #[cfg(feature = "live-metrics")]
 async fn live_metrics() {
+    use opentelemetry_application_insights::LiveMetricsSpanProcessor;
+
     let requests = record(TokioTick, |client| {
-        let tracer_provider = new_pipeline_from_connection_string(CONNECTION_STRING)
-            .expect("connection string is valid")
-            .with_client(client)
-            .with_live_metrics(true)
-            .build_batch(opentelemetry_sdk::runtime::TokioCurrentThread);
+        let exporter = Exporter::new_from_connection_string(CONNECTION_STRING, client)
+            .expect("connection string is valid");
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_span_processor(opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(exporter.clone(), opentelemetry_sdk::runtime::TokioCurrentThread).build())
+            .with_span_processor(LiveMetricsSpanProcessor::new(exporter, opentelemetry_sdk::runtime::TokioCurrentThread))
+            .build();
         let tracer = tracer_provider.tracer("test");
 
         // Wait for one ping request so we start to collect metrics.
@@ -258,8 +312,10 @@ async fn live_metrics() {
             span.record_error(error.as_ref());
         }
 
-        // Wait for two pong requests.
+        // Wait for two post requests.
         std::thread::sleep(Duration::from_secs(2));
+
+        tracer_provider.shutdown().unwrap();
     });
     let live_metrics = requests_to_string(requests);
     insta::assert_snapshot!(live_metrics);
@@ -278,13 +334,13 @@ mod recording_client {
 
     #[derive(Debug, Clone)]
     pub struct RecordingClient {
-        requests: Arc<Mutex<Vec<Request<Vec<u8>>>>>,
+        requests: Arc<Mutex<Vec<Request<Bytes>>>>,
         tick: Arc<dyn Tick>,
     }
 
     #[async_trait]
     impl HttpClient for RecordingClient {
-        async fn send(&self, req: Request<Vec<u8>>) -> Result<Response<Bytes>, HttpError> {
+        async fn send_bytes(&self, req: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
             self.tick.tick().await;
 
             let is_live_metrics = req.uri().path().contains("QuickPulseService.svc");
@@ -317,15 +373,14 @@ mod recording_client {
     pub fn record(
         tick: impl Tick + 'static,
         generate_fn: impl Fn(RecordingClient),
-    ) -> Vec<Request<Vec<u8>>> {
+    ) -> Vec<Request<Bytes>> {
         let requests = Arc::new(Mutex::new(Vec::new()));
         generate_fn(RecordingClient {
             requests: Arc::clone(&requests),
             tick: Arc::new(tick),
         });
 
-        // Give async runtime some time to quit. I don't see any way to properly wait for tasks
-        // spawned with async-std.
+        // Wait for async span processors to stop.
         std::thread::sleep(Duration::from_secs(1));
 
         Arc::try_unwrap(requests)
@@ -353,16 +408,6 @@ mod tick {
     }
 
     #[derive(Debug)]
-    pub struct AsyncStdTick;
-
-    #[async_trait]
-    impl Tick for AsyncStdTick {
-        async fn tick(&self) {
-            async_std::task::sleep(Duration::from_millis(1)).await;
-        }
-    }
-
-    #[derive(Debug)]
     pub struct TokioTick;
 
     #[async_trait]
@@ -374,15 +419,16 @@ mod tick {
 }
 
 mod format {
-    use std::{sync::OnceLock, time::Duration};
-
+    use bytes::Bytes;
     use flate2::read::GzDecoder;
     use http::{HeaderName, Request};
+    use opentelemetry::Key;
     use opentelemetry_sdk::resource::{ResourceDetector, TelemetryResourceDetector};
     use opentelemetry_semantic_conventions as semcov;
     use regex::Regex;
+    use std::sync::OnceLock;
 
-    pub fn requests_to_string(requests: Vec<Request<Vec<u8>>>) -> String {
+    pub fn requests_to_string(requests: Vec<Request<Bytes>>) -> String {
         requests
             .into_iter()
             .map(request_to_string)
@@ -390,7 +436,7 @@ mod format {
             .join("\n\n\n")
     }
 
-    fn request_to_string(req: Request<Vec<u8>>) -> String {
+    fn request_to_string(req: Request<Bytes>) -> String {
         let method = req.method();
         let path = req.uri().path_and_query().expect("path exists");
         let version = format!("{:?}", req.version());
@@ -439,8 +485,10 @@ mod format {
             }
         }
         let otel_version = TelemetryResourceDetector
-            .detect(Duration::ZERO)
-            .get(semcov::resource::TELEMETRY_SDK_VERSION.into())
+            .detect()
+            .get(&Key::from_static_str(
+                semcov::resource::TELEMETRY_SDK_VERSION,
+            ))
             .expect("TelemetryResourceDetector provides TELEMETRY_SDK_VERSION")
             .to_string();
         static STRIP_CONFIGS: OnceLock<Vec<Strip>> = OnceLock::new();
@@ -458,6 +506,7 @@ mod format {
                 Strip::new(r#"(?P<prefix>"\\\\Memory\\\\Committed Bytes",\s*)"(?P<field>Value)": \d+\.\d+"#),
                 Strip::new(&format!(r#""(?P<field>telemetry\.sdk\.version)": "{otel_version}""#)),
                 Strip::new(&format!(r#""(?P<field>ai\.internal\.sdkVersion)": "opentelemetry:{otel_version}""#)),
+                Strip::new(&format!(r#""(?P<field>Version)": "opentelemetry:{otel_version}""#)),
             ]
         });
 

@@ -3,18 +3,15 @@ use crate::{
     tags::get_tags_for_resource,
     trace::{get_duration, is_remote_dependency_success, is_request_success, EVENT_NAME_EXCEPTION},
     uploader_quick_pulse::{self, PostOrPing},
-    Error,
+    Error, Exporter,
 };
 use futures_util::{pin_mut, select_biased, FutureExt as _, StreamExt as _};
-use opentelemetry::{
-    trace::{SpanKind, TraceResult},
-    Context, Key,
-};
+use opentelemetry::{trace::SpanKind, Context, Key};
 use opentelemetry_http::HttpClient;
 use opentelemetry_sdk::{
-    export::trace::SpanData,
+    error::OTelSdkResult,
     runtime::{RuntimeChannel, TrySend},
-    trace::{IdGenerator as _, RandomIdGenerator, Span, SpanProcessor},
+    trace::{IdGenerator as _, RandomIdGenerator, Span, SpanData, SpanProcessor},
     Resource,
 };
 use opentelemetry_semantic_conventions as semcov;
@@ -23,10 +20,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, System};
 
 const MAX_POST_WAIT_TIME: Duration = Duration::from_secs(20);
 const MAX_PING_WAIT_TIME: Duration = Duration::from_secs(60);
@@ -44,15 +40,38 @@ const METRIC_DEPENDENCY_FAILURE_RATE: &str = "\\ApplicationInsights\\Dependency 
 const METRIC_DEPENDENCY_DURATION: &str = "\\ApplicationInsights\\Dependency Call Duration";
 const METRIC_EXCEPTION_RATE: &str = "\\ApplicationInsights\\Exceptions/Sec";
 
-pub(crate) struct QuickPulseManager<R: RuntimeChannel> {
+/// Application Insights live metrics span processor
+///
+/// Enables live metrics collection: <https://learn.microsoft.com/en-us/azure/azure-monitor/app/live-stream>.
+///
+/// ```no_run
+/// #[tokio::main]
+/// async fn main() {
+///     let exporter = opentelemetry_application_insights::Exporter::new_from_connection_string(
+///         "connection_string",
+///         reqwest::Client::new(),
+///     )
+///     .expect("valid connection string");
+///     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+///        .with_span_processor(opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(exporter.clone(), opentelemetry_sdk::runtime::Tokio).build())
+///        .with_span_processor(opentelemetry_application_insights::LiveMetricsSpanProcessor::new(exporter, opentelemetry_sdk::runtime::Tokio))
+///        .build();
+///     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+///
+///     // ... send traces ...
+///
+///     tracer_provider.shutdown().unwrap();
+/// }
+/// ```
+pub struct LiveMetricsSpanProcessor<R: RuntimeChannel> {
     is_collecting: Arc<AtomicBool>,
-    metrics_collector: Arc<Mutex<MetricsCollector>>,
+    shared: Arc<Mutex<Shared>>,
     message_sender: R::Sender<Message>,
 }
 
-impl<R: RuntimeChannel> std::fmt::Debug for QuickPulseManager<R> {
+impl<R: RuntimeChannel> std::fmt::Debug for LiveMetricsSpanProcessor<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuickPulseManager").finish()
+        f.debug_struct("LiveMetricsSpanProcessor").finish()
     }
 }
 
@@ -62,27 +81,31 @@ enum Message {
     Stop,
 }
 
-impl<R: RuntimeChannel> QuickPulseManager<R> {
-    pub(crate) fn new<C: HttpClient + 'static>(
-        client: Arc<C>,
-        live_metrics_endpoint: http::Uri,
-        instrumentation_key: String,
-        resource: Resource,
+impl<R: RuntimeChannel> LiveMetricsSpanProcessor<R> {
+    /// Create new live metrics span processor.
+    pub fn new<C: HttpClient + 'static>(
+        exporter: Exporter<C>,
         runtime: R,
-    ) -> QuickPulseManager<R> {
+    ) -> LiveMetricsSpanProcessor<R> {
         let (message_sender, message_receiver) = runtime.batch_message_channel(1);
         let delay_runtime = runtime.clone();
         let is_collecting_outer = Arc::new(AtomicBool::new(false));
         let is_collecting = is_collecting_outer.clone();
-        let metrics_collector_outer = Arc::new(Mutex::new(MetricsCollector::new()));
-        let metrics_collector = metrics_collector_outer.clone();
+        let shared_outer = Arc::new(Mutex::new(Shared {
+            metrics_collector: MetricsCollector::new(),
+            resource_data: (&exporter.resource).into(),
+        }));
+        let shared = shared_outer.clone();
         runtime.spawn(Box::pin(async move {
-            let mut sender =
-                QuickPulseSender::new(client, live_metrics_endpoint, instrumentation_key, resource);
+            let mut sender = Sender::new(
+                exporter.client,
+                exporter.live_post_endpoint,
+                exporter.live_ping_endpoint,
+            );
 
             let message_receiver = message_receiver.fuse();
             pin_mut!(message_receiver);
-            let mut send_delay = delay_runtime.delay(PING_INTERVAL).fuse();
+            let mut send_delay = Box::pin(delay_runtime.delay(PING_INTERVAL).fuse());
 
             loop {
                 let msg = select_biased! {
@@ -92,57 +115,70 @@ impl<R: RuntimeChannel> QuickPulseManager<R> {
                 match msg {
                     Message::Send => {
                         let curr_is_collecting = is_collecting.load(Ordering::SeqCst);
-                        let metrics = if curr_is_collecting {
-                            metrics_collector.lock().unwrap().collect_and_reset()
-                        } else {
-                            Vec::new()
+                        let (resource_data, metrics) = {
+                            let mut shared = shared.lock().unwrap();
+                            let resource_data = shared.resource_data.clone();
+                            let metrics = curr_is_collecting
+                                .then(|| shared.metrics_collector.collect_and_reset())
+                                .unwrap_or_default();
+                            (resource_data, metrics)
                         };
-                        let (next_is_collecting, next_timeout) =
-                            sender.send(curr_is_collecting, metrics).await;
+                        let (next_is_collecting, next_timeout) = sender
+                            .send(curr_is_collecting, resource_data, metrics)
+                            .await;
                         if curr_is_collecting != next_is_collecting {
                             is_collecting.store(next_is_collecting, Ordering::SeqCst);
                             if next_is_collecting {
                                 // Reset last collection time to get accurate metrics on next collection.
-                                metrics_collector.lock().unwrap().reset();
+                                shared.lock().unwrap().metrics_collector.reset();
                             }
                         }
-                        send_delay = delay_runtime.delay(next_timeout).fuse();
+                        send_delay = Box::pin(delay_runtime.delay(next_timeout).fuse());
                     }
                     Message::Stop => break,
                 }
             }
         }));
 
-        QuickPulseManager {
+        LiveMetricsSpanProcessor {
             is_collecting: is_collecting_outer,
-            metrics_collector: metrics_collector_outer,
+            shared: shared_outer,
             message_sender,
         }
     }
 }
 
-impl<R: RuntimeChannel> SpanProcessor for QuickPulseManager<R> {
+impl<R: RuntimeChannel> SpanProcessor for LiveMetricsSpanProcessor<R> {
     fn on_start(&self, _span: &mut Span, _cx: &Context) {}
 
     fn on_end(&self, span: SpanData) {
         if self.is_collecting.load(Ordering::SeqCst) {
-            self.metrics_collector.lock().unwrap().count_span(span);
+            self.shared
+                .lock()
+                .unwrap()
+                .metrics_collector
+                .count_span(span);
         }
     }
 
-    fn force_flush(&self) -> TraceResult<()> {
+    fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
 
-    fn shutdown(&self) -> TraceResult<()> {
+    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
         self.message_sender
             .try_send(Message::Stop)
-            .map_err(Error::QuickPulseShutdown)?;
-        Ok(())
+            .map_err(Error::QuickPulseShutdown)
+            .map_err(Into::into)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.resource_data = resource.into();
     }
 }
 
-impl<R: RuntimeChannel> Drop for QuickPulseManager<R> {
+impl<R: RuntimeChannel> Drop for LiveMetricsSpanProcessor<R> {
     fn drop(&mut self) {
         if let Err(err) = self.shutdown() {
             let err: &dyn std::error::Error = &err;
@@ -151,39 +187,28 @@ impl<R: RuntimeChannel> Drop for QuickPulseManager<R> {
     }
 }
 
-struct QuickPulseSender<C: HttpClient + 'static> {
-    client: Arc<C>,
-    host: http::Uri,
-    instrumentation_key: String,
-    last_success_time: SystemTime,
-    polling_interval_hint: Option<Duration>,
+struct Shared {
+    resource_data: ResourceData,
+    metrics_collector: MetricsCollector,
+}
+
+#[derive(Clone)]
+struct ResourceData {
     version: Option<String>,
-    stream_id: String,
     machine_name: String,
     instance: String,
     role_name: Option<String>,
 }
 
-impl<C: HttpClient + 'static> QuickPulseSender<C> {
-    fn new(
-        client: Arc<C>,
-        host: http::Uri,
-        instrumentation_key: String,
-        resource: Resource,
-    ) -> Self {
-        let mut tags = get_tags_for_resource(&resource);
+impl From<&Resource> for ResourceData {
+    fn from(resource: &Resource) -> Self {
+        let mut tags = get_tags_for_resource(resource);
         let machine_name = resource
-            .get(Key::from_static_str(semcov::resource::HOST_NAME))
+            .get(&Key::from_static_str(semcov::resource::HOST_NAME))
             .map(|v| v.as_str().into_owned())
             .unwrap_or_else(|| "Unknown".into());
         Self {
-            client,
-            host,
-            instrumentation_key,
-            last_success_time: SystemTime::now(),
-            polling_interval_hint: None,
             version: tags.remove(context_tag_keys::INTERNAL_SDK_VERSION),
-            stream_id: format!("{:032x}", RandomIdGenerator::default().new_trace_id()),
             role_name: tags.remove(context_tag_keys::CLOUD_ROLE),
             instance: tags
                 .remove(context_tag_keys::CLOUD_ROLE_INSTANCE)
@@ -191,10 +216,33 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
             machine_name,
         }
     }
+}
+
+struct Sender<C: HttpClient + 'static> {
+    client: Arc<C>,
+    live_post_endpoint: http::Uri,
+    live_ping_endpoint: http::Uri,
+    last_success_time: SystemTime,
+    polling_interval_hint: Option<Duration>,
+    stream_id: String,
+}
+
+impl<C: HttpClient + 'static> Sender<C> {
+    fn new(client: Arc<C>, live_post_endpoint: http::Uri, live_ping_endpoint: http::Uri) -> Self {
+        Self {
+            client,
+            live_post_endpoint,
+            live_ping_endpoint,
+            last_success_time: SystemTime::now(),
+            polling_interval_hint: None,
+            stream_id: format!("{:032x}", RandomIdGenerator::default().new_trace_id()),
+        }
+    }
 
     async fn send(
         &mut self,
         is_collecting: bool,
+        resource_data: ResourceData,
         metrics: Vec<QuickPulseMetric>,
     ) -> (bool, Duration) {
         let now = SystemTime::now();
@@ -206,17 +254,20 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
             metrics,
             invariant_version: 1,
             timestamp: format!("/Date({})/", now_ms),
-            version: self.version.clone(),
+            version: resource_data.version,
             stream_id: self.stream_id.clone(),
-            machine_name: self.machine_name.clone(),
-            instance: self.instance.clone(),
-            role_name: self.role_name.clone(),
+            machine_name: resource_data.machine_name,
+            instance: resource_data.instance,
+            role_name: resource_data.role_name,
         };
 
         let res = uploader_quick_pulse::send(
             self.client.as_ref(),
-            &self.host,
-            &self.instrumentation_key,
+            if is_collecting {
+                &self.live_post_endpoint
+            } else {
+                &self.live_ping_endpoint
+            },
             if is_collecting {
                 PostOrPing::Post
             } else {
@@ -228,7 +279,10 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
         let (last_send_succeeded, mut next_is_collecting) = if let Ok(res) = res {
             self.last_success_time = now;
             if let Some(redirected_host) = res.redirected_host {
-                self.host = redirected_host;
+                self.live_post_endpoint =
+                    replace_host(self.live_post_endpoint.clone(), redirected_host.clone());
+                self.live_ping_endpoint =
+                    replace_host(self.live_ping_endpoint.clone(), redirected_host);
             }
             if res.polling_interval_hint.is_some() {
                 self.polling_interval_hint = res.polling_interval_hint;
@@ -263,7 +317,8 @@ impl<C: HttpClient + 'static> QuickPulseSender<C> {
 
 struct MetricsCollector {
     system: System,
-    system_refresh_kind: RefreshKind,
+    process_refresh_kind: ProcessRefreshKind,
+    process_id: Pid,
     request_count: usize,
     request_failed_count: usize,
     request_duration: Duration,
@@ -278,9 +333,8 @@ impl MetricsCollector {
     fn new() -> Self {
         Self {
             system: System::new(),
-            system_refresh_kind: RefreshKind::new()
-                .with_cpu(CpuRefreshKind::new().with_cpu_usage())
-                .with_memory(MemoryRefreshKind::new().with_ram()),
+            process_refresh_kind: ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            process_id: Pid::from_u32(std::process::id()),
             request_count: 0,
             request_failed_count: 0,
             request_duration: Duration::default(),
@@ -331,7 +385,11 @@ impl MetricsCollector {
 
     fn collect_and_reset(&mut self) -> Vec<QuickPulseMetric> {
         let mut metrics = Vec::new();
-        self.system.refresh_specifics(self.system_refresh_kind);
+        self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[self.process_id]),
+            true,
+            self.process_refresh_kind,
+        );
         self.collect_cpu_usage(&mut metrics);
         self.collect_memory_usage(&mut metrics);
         self.collect_requests_dependencies_exceptions(&mut metrics);
@@ -340,10 +398,12 @@ impl MetricsCollector {
     }
 
     fn collect_cpu_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
-        let mut cpu_usage = 0.;
-        for cpu in self.system.cpus() {
-            cpu_usage += f64::from(cpu.cpu_usage());
-        }
+        let cpu_usage = if let Some(process) = self.system.process(self.process_id) {
+            f64::from(process.cpu_usage())
+        } else {
+            0.
+        };
+
         metrics.push(QuickPulseMetric {
             name: METRIC_PROCESSOR_TIME,
             value: cpu_usage,
@@ -352,9 +412,15 @@ impl MetricsCollector {
     }
 
     fn collect_memory_usage(&mut self, metrics: &mut Vec<QuickPulseMetric>) {
+        let memory_usage = if let Some(process) = self.system.process(self.process_id) {
+            process.memory()
+        } else {
+            0
+        };
+
         metrics.push(QuickPulseMetric {
             name: METRIC_COMMITTED_BYTES,
-            value: self.system.used_memory() as f64,
+            value: memory_usage as f64,
             weight: 1,
         });
     }
@@ -410,4 +476,12 @@ impl MetricsCollector {
             weight: 1,
         });
     }
+}
+
+fn replace_host(uri: http::Uri, new_host: http::Uri) -> http::Uri {
+    let mut parts = uri.into_parts();
+    let new_parts = new_host.into_parts();
+    parts.scheme = new_parts.scheme;
+    parts.authority = new_parts.authority;
+    http::Uri::from_parts(parts).expect("valid uri + valid uri = valid uri")
 }

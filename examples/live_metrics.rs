@@ -1,25 +1,29 @@
 use opentelemetry::{
-    trace::{Span, SpanKind, Status, Tracer as _},
+    trace::{Span, SpanKind, Status, Tracer as _, TracerProvider as _},
     KeyValue,
 };
 use opentelemetry_semantic_conventions as semcov;
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     env_logger::init();
 
-    let tracer = opentelemetry_application_insights::new_pipeline_from_env()?
-        .with_client(reqwest::Client::new())
-        .with_live_metrics(true)
-        .install_batch(opentelemetry_sdk::runtime::Tokio);
+    let exporter =
+        opentelemetry_application_insights::Exporter::new_from_env(reqwest::Client::new())
+            .expect("valid connection string");
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_span_processor(opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(exporter.clone(), opentelemetry_sdk::runtime::Tokio).build())
+        .with_span_processor(opentelemetry_application_insights::LiveMetricsSpanProcessor::new(exporter, opentelemetry_sdk::runtime::Tokio))
+        .build();
+    let tracer = tracer_provider.tracer("test");
 
-    print!("Simulating requests. Press Ctrl+C to stop.");
+    println!("Simulating requests. Press Ctrl+C to stop.");
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
     loop {
-        let success = rng.gen_ratio(9, 10);
+        let success = rng.random_ratio(9, 10);
         let _request = tracer
             .span_builder("request")
             .with_kind(SpanKind::Server)

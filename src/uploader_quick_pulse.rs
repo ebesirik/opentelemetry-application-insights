@@ -1,8 +1,5 @@
-use crate::{
-    models::QuickPulseEnvelope,
-    uploader::{append_path, serialize_request_body},
-    Error, HttpClient,
-};
+use crate::{models::QuickPulseEnvelope, uploader::serialize_request_body, Error, HttpClient};
+use bytes::Bytes;
 use http::{HeaderName, Request, Uri};
 use std::{
     convert::TryFrom,
@@ -53,19 +50,9 @@ pub(crate) struct QuickPulseResponse {
 pub(crate) async fn send(
     client: &dyn HttpClient,
     endpoint: &Uri,
-    instrumentation_key: &str,
     post_or_ping: PostOrPing,
     envelope: QuickPulseEnvelope,
 ) -> Result<QuickPulseResponse, Error> {
-    let endpoint = append_path(
-        endpoint,
-        format!(
-            "QuickPulseService.svc/{}?ikey={}",
-            post_or_ping, instrumentation_key
-        ),
-    )
-    .map_err(|err| Error::Upload(err.to_string()))?;
-
     let payload = serialize_envelope(&envelope, &post_or_ping)?;
 
     let mut request_builder = Request::post(endpoint)
@@ -88,11 +75,11 @@ pub(crate) async fn send(
     }
 
     let request = request_builder
-        .body(payload)
+        .body(Bytes::from(payload))
         .expect("request should be valid");
 
     let response = client
-        .send(request)
+        .send_bytes(request)
         .await
         .map_err(Error::UploadConnection)?;
 
@@ -136,7 +123,7 @@ fn serialize_envelope(
         PostOrPing::Ping => serde_json::to_vec(&envelope),
     }
     .map_err(Error::UploadSerializeRequest)?;
-    serialize_request_body(serialized)
+    serialize_request_body(&serialized)
 }
 
 /// Time the request was made.
